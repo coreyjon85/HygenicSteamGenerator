@@ -122,7 +122,7 @@ Slave 0:
 + │ EL2008      │
 + └─────────────┘
 
-
+```
            C6015
                        │
           EtherCAT Master (IgH)
@@ -139,7 +139,7 @@ Slave 0:
                           Temp
                           Level
                           Flow
-
+```
 We've demonstrated:
 
 The PREEMPT_RT kernel is stable.
