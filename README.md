@@ -1,6 +1,8 @@
 # Steam Generator Project
 DIY Low cost low pressure culinary steam generator for steaming rice.
 
+# Disclaimer: None of this is necessary. Some contactors, a few switches, some old school mechanical back-ups (over pressure/vacuum relief), maybe a few other odds and ends - but that would probably get you close. This is a dive down the rabbit hole to explore safety, control, Data in the brewery. This is excessive and no one should follow this. Also, the end goal is to make steam, and even low pressure steam can do some serious bodily harm. Be safe, be smart. 
+
 # PLC control, safety monitoring, logging, and data display.
 + Using Beckoff and Ifm equipment, bring in hygienic sensor data over IO Link to EtherCAT to PLC interface. Run local control/safety loop. Transmit/Log/Display relevant information through MQTT/JSON to Home Assistant to log data in Influx DB for display in Grafana. 
 
