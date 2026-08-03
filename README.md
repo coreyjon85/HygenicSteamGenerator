@@ -158,4 +158,58 @@ Stage 1 Acceptance Criterion: After a complete power cycle, the controller autom
 + Tomorrows plan:
            
 Test Input/Output
+
+Some useful ethernet commands:
+systemctl is-enabled ethercat.service
+systemctl is-active ethercat.service
+lsmod | grep '^ec_'
+sudo /usr/local/bin/ethercat master
+sudo /usr/local/bin/ethercat slaves
+
+got a permissions issue with my logged in user and the ethercat commands
+lets check permissions:
+ls -l /dev/EtherCAT0
+crw------- 1 root root 235, 0 Aug  3 15:09 /dev/EtherCAT0
+
+gonna create a ethercat group and udev rule
+sudo groupadd -f ethercat
+sudo usermod -aG ethercat "$USER"
+sudo nano /etc/udev/rules.d/99-ethercat.rules
+KERNEL=="EtherCAT[0-9]*", GROUP="ethercat", MODE="0660"
+sudo udevadm control --reload-rules
+sudo systemctl restart ethercat.service
+
+ls -l /dev/EtherCAT0
+crw-rw---- 1 root ethercat 235, 0 Aug  3 16:01 /dev/EtherCAT0
+
+reboot
+check
+groups
+ethercat should now show up
+
+now back to checking the EtherCAT system with: EtherCAT bus inspection commands
+ethercat slaves -v
+ethercat pdos
+ethercat cstruct
   
+```
+C6015 / IgH Master
+  └─ Slave 0: EK1100
+      └─ Slave 1: EL1008, 8 digital inputs
+          └─ Slave 2: EL2008, 8 digital outputs
+
+EL1008: 8 input bits  = 1 byte
+EL2008: 8 output bits = 1 byte
+
+EL1008
+Channel 1 → 0x6000:01
+Channel 2 → 0x6010:01
+...
+Channel 8 → 0x6070:01
+
+EL2008
+Channel 1 → 0x7000:01
+Channel 2 → 0x7010:01
+...
+Channel 8 → 0x7070:01
+```
