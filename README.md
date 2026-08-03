@@ -67,7 +67,7 @@ DIY Low cost low pressure culinary steam generator for steaming rice.
 
   +  git describe --tags
   +  sudo ./bootstrap
-  +  sudo ./configure \
+  + ./configure \
     --enable-igb \
     --enable-generic \
     --disable-8139too \
@@ -76,7 +76,7 @@ DIY Low cost low pressure culinary steam generator for steaming rice.
     --disable-r8169
 
   + make -j$(nproc)
-  + sudo make install
+  + make install
   + sudo ldconfig
 
  + Configure the EtherCAt mASTER
@@ -84,8 +84,52 @@ DIY Low cost low pressure culinary steam generator for steaming rice.
       MASTER0_DEVICE="enp1s0"
       DEVICE_MODULES="generic"
 
- + d  
 
-    
+
++Acceptance test: PASS
+
+Service:
+  ethercat.service enabled
+  ethercat.service active
+
+Modules:
+  ec_generic loaded
+  ec_master loaded
+
+Master:
+  Phase: Idle
+  Link: UP
+  Slaves: 1
+  Lost frames: 0
+  Frame loss: 0.0%
+
+Slave 0:
+  EK1100 EtherCAT-Koppler
+  State: PREOP 
+
+
+
+    Beckhoff C6015
+│
+└── Intel I210 (enp1s0)
+    │
+    ▼
+┌─────────────┐
+│ EK1100      │
+├─────────────┤
+│ EL1008      │
+├─────────────┤
+│ EL2008      │
+└─────────────┘
+
+We've demonstrated:
+
+The PREEMPT_RT kernel is stable.
+The Intel I210 is operating reliably with the IgH Generic driver.
+The EtherCAT master starts automatically via systemd.
+The bus topology is detected correctly after a reboot.
+The E-bus communication through the EK1100 is functioning.
+Additional terminals are automatically enumerated.
+Communication is occurring without packet loss.
 
 
