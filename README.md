@@ -1422,3 +1422,73 @@ cleanup:
    
 + Next steps:
 Connect the IFM AL1333 to the EtherCAT fieldbus, and test that connection, then add in some IO link devices for testing. The goal is to determine if its best to use something like codesys which is only a "soft" real time, or program our own realtime scheduler in C, then add the required "modules" to complete out the system. 
+
++ Pause for some system integration
+Wired the M12 for the IFM AL1333 power, and connected the M12 12thernet port to port 2 on the ek1100
+Installed one IO-Link sensor, a PT100 probe.
+
+```
+                    STEAM OUT
+                        │
+               ┌────────┴────────┐
+               │                 │
+               │   PM1704        │  Vessel pressure
+               │                 │
+               │   TD2531 or     │  Steam/water temperature
+               │   TR2439+RTD    │
+               │                 │
+               │   LR2750        │  Continuous water level
+               │                 │
+               │   LMT100        │  Independent low-level trip
+               │                 │
+               └───────┬─────────┘
+                       │
+                    HEAT INPUT
+```
+```
+X01 — PM1704 pressure
+X02 — LR2750 continuous level
+X03 — LMT100 low-water switch
+X04 — TR2439 temperature
+X05 — TD2531 temperature
+X06–X08 — spare
+```
+
+# Where we're going, we don't need CODESYS
++ So now to develop a light weight control system from thin air. Will continue leveraging the IgH EtherCAT software, and the previous integrations. Up to this point it was core system set up, initialize EtherCAT, and test interfaces. All have passed their checks, so now its time to move on to the next piece of software.
+
++ High level overview, build a simple runtime that:
+  + Starts as a systemd service
+  + requests IgH master 0
+  + Confiogures the know bus
+  + Runs cyclic tasks
+  + Exposes a normalized process model
+  + Forces all outputs safe on shutdown, communications loss, or other detected fault.
+ 
+```
+typedef struct {
+    struct {
+        bool inputs[8];
+        bool outputs[8];
+    } cabinet_io;
+
+    struct {
+        float temperature_c;
+        float pressure_bar;
+        float level_mm;
+        bool low_level;
+        bool valid;
+    } steam_generator;
+} process_image_t;
+```
+
++ State Machine Plan
+```
+OFF
+→ FILLING
+→ READY
+→ HEATING
+→ PRESSURE_CONTROL
+→ SHUTDOWN
+→ FAULT_LOCKOUT
+```
