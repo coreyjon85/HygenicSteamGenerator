@@ -4,6 +4,15 @@ DIY Low cost low pressure culinary steam generator for steaming rice.
 # PLC control, safety monitoring, logging, and data display.
 + Using Beckoff and Ifm equipment, bring in hygienic sensor data over IO Link to EtherCAT to PLC interface. Run local control/safety loop. Transmit/Log/Display relevant information through MQTT/JSON to Home Assistant to log data in Influx DB for display in Grafana. 
 
+# The Plan
++ Beckoff C6015: running Ubuntu Pro +PREEMPT_RT
++ IgH Ethercat Master: Controlling the fieldbus
++ Beckoff EtherCAT I/O (EL Terminals)
++ Structured IEC 61131-3 Control Logic
++ MQTT/ADS Bridge to publish process data
++ InfluxDB + Grafana: running on separate server to display dashboards
++ Home Assistant: Non-Critical monitoring & notifications
+
 # PLC Setup
 + Beckoff C6015-0010 Industrial PC.
   + Installed Ubuntu Server 22.04 (ensure the version supports realtime-kernel).
@@ -79,11 +88,4 @@ DIY Low cost low pressure culinary steam generator for steaming rice.
 
     
 
-# The Plan
-+ Beckoff C6015: running Ubuntu Pro +PREEMPT_RT
-+ IgH Ethercat Master: Controlling the fieldbus
-+ Beckoff EtherCAT I/O (EL Terminals)
-+ Structured IEC 61131-3 Control Logic
-+ MQTT/ADS Bridge to publish process data
-+ InfluxDB + Grafana: running on separate server to display dashboards
-+ Home Assistant: Non-Critical monitoring & notifications
+
