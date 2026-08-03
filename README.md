@@ -122,6 +122,23 @@ Slave 0:
 │ EL2008      │
 └─────────────┘
 
+           C6015
+                       │
+          EtherCAT Master (IgH)
+                       │
+        ┌──────────────┴──────────────┐
+        │                             │
+     EK1100                      AL1333
+        │                             │
+        │                      IO-Link
+        │                             │
+   EL1008 EL2008              Sensors
+                               │
+                          Pressure
+                          Temp
+                          Level
+                          Flow
+
 We've demonstrated:
 
 The PREEMPT_RT kernel is stable.
@@ -132,4 +149,7 @@ The E-bus communication through the EK1100 is functioning.
 Additional terminals are automatically enumerated.
 Communication is occurring without packet loss.
 
-
++ Tomorrows plan:
+           
+Test Input/Output
+  
