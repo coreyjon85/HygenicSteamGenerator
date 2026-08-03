@@ -150,6 +150,8 @@ The E-bus communication through the EK1100 is functioning.
 Additional terminals are automatically enumerated.
 Communication is occurring without packet loss.
 
+Stage 1 Acceptance Criterion: After a complete power cycle, the controller automatically starts the EtherCAT master, binds the Intel I210 interface, enumerates the EK1100, EL1008, and EL2008, reports zero lost frames, and requires no manual intervention.
+
 + Tomorrows plan:
            
 Test Input/Output
