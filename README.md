@@ -122,6 +122,7 @@ Slave 0:
 │ EL2008      │
 └─────────────┘
 
+
            C6015
                        │
           EtherCAT Master (IgH)
