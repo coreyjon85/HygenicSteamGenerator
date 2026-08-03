@@ -41,9 +41,8 @@ DIY Low cost low pressure culinary steam generator for steaming rice.
    + Intel I210 NICS x2
    + Management NIC: enp2s0
    + EtherCAT NIC: enp1s0
-   + IF ALL Above are true, then we are ready to install the EtherCAT Master software!
    
-    + IgH EtherCAT Master install
++ IgH EtherCAT Master install
      sudo apt install -y \
     git \
     build-essential \
@@ -57,10 +56,11 @@ DIY Low cost low pressure culinary steam generator for steaming rice.
     libudev-dev \
     linux-headers-$(uname -r)
      
-    + Verify the headers match RT kernerl
++ Verify the headers match RT kernerl
       + ls /usr/src/linux-headers-$(uname -r)
-     
-  + Clone IgH EtherCAT master
+
+
+ + Clone IgH EtherCAT master
   + cd /usr/src
   + sudo git clone https://gitlab.com/etherlab.org/ethercat.git
   + cd ethercat 
