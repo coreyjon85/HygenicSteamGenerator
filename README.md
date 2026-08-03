@@ -213,3 +213,512 @@ Channel 2 → 0x7010:01
 ...
 Channel 8 → 0x7070:01
 ```
+
+Hello world - sorta
+More like, blink this LED.
+
+To light an LED on the 2008. we need a small aplication that can:
++ Requests Master 0.
++ Creates a process-data domain.
++ Registers the EL1008 and EL2008 PDO entries.
++ Activates the master.
++ Runs a cyclic loop.
++ Writes bits into the EL2008 process image.
++ Sends and receives EtherCAT frames.
+
+A small C program that will "Chase" The LEDs on the EL2008, and will also monitor the inputs on the EL1008.
+mkdir -p ~/ethercat-io-test
+cd ~/ethercat-io-test
+
+ls /usr/local/include/ecrt.h
+ls /usr/local/lib/libethercat.so
+
+nano ethercat_io_test.c
+
+```
+#define _POSIX_C_SOURCE 200809L
+
+#include <errno.h>
+#include <signal.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+#include <ecrt.h>
+
+#define MASTER_INDEX 0
+
+#define EK_ALIAS      0
+#define EL1008_POS    1
+#define EL2008_POS    2
+
+#define BECKHOFF_VENDOR_ID 0x00000002
+#define EL1008_PRODUCT     0x03f03052
+#define EL2008_PRODUCT     0x07d83052
+
+#define CYCLE_NS 1000000L  /* 1 ms */
+
+static volatile sig_atomic_t keep_running = 1;
+
+static ec_master_t *master = NULL;
+static ec_domain_t *domain = NULL;
+static uint8_t *domain_pd = NULL;
+
+static unsigned int input_offset[8];
+static unsigned int input_bit[8];
+static unsigned int output_offset[8];
+static unsigned int output_bit[8];
+
+/* EL1008: eight 1-bit input PDOs. */
+static ec_pdo_entry_info_t el1008_entries[] = {
+    {0x6000, 0x01, 1},
+    {0x6010, 0x01, 1},
+    {0x6020, 0x01, 1},
+    {0x6030, 0x01, 1},
+    {0x6040, 0x01, 1},
+    {0x6050, 0x01, 1},
+    {0x6060, 0x01, 1},
+    {0x6070, 0x01, 1},
+};
+
+static ec_pdo_info_t el1008_pdos[] = {
+    {0x1a00, 1, el1008_entries + 0},
+    {0x1a01, 1, el1008_entries + 1},
+    {0x1a02, 1, el1008_entries + 2},
+    {0x1a03, 1, el1008_entries + 3},
+    {0x1a04, 1, el1008_entries + 4},
+    {0x1a05, 1, el1008_entries + 5},
+    {0x1a06, 1, el1008_entries + 6},
+    {0x1a07, 1, el1008_entries + 7},
+};
+
+static ec_sync_info_t el1008_syncs[] = {
+    {0, EC_DIR_INPUT, 8, el1008_pdos, EC_WD_DISABLE},
+    {0xff, EC_DIR_INVALID, 0, NULL, EC_WD_DISABLE}
+};
+
+/* EL2008: eight 1-bit output PDOs. */
+static ec_pdo_entry_info_t el2008_entries[] = {
+    {0x7000, 0x01, 1},
+    {0x7010, 0x01, 1},
+    {0x7020, 0x01, 1},
+    {0x7030, 0x01, 1},
+    {0x7040, 0x01, 1},
+    {0x7050, 0x01, 1},
+    {0x7060, 0x01, 1},
+    {0x7070, 0x01, 1},
+};
+
+static ec_pdo_info_t el2008_pdos[] = {
+    {0x1600, 1, el2008_entries + 0},
+    {0x1601, 1, el2008_entries + 1},
+    {0x1602, 1, el2008_entries + 2},
+    {0x1603, 1, el2008_entries + 3},
+    {0x1604, 1, el2008_entries + 4},
+    {0x1605, 1, el2008_entries + 5},
+    {0x1606, 1, el2008_entries + 6},
+    {0x1607, 1, el2008_entries + 7},
+};
+
+static ec_sync_info_t el2008_syncs[] = {
+    {0, EC_DIR_OUTPUT, 8, el2008_pdos, EC_WD_ENABLE},
+    {0xff, EC_DIR_INVALID, 0, NULL, EC_WD_DISABLE}
+};
+
+static ec_pdo_entry_reg_t domain_regs[] = {
+    {EK_ALIAS, EL1008_POS, BECKHOFF_VENDOR_ID, EL1008_PRODUCT,
+     0x6000, 0x01, &input_offset[0], &input_bit[0]},
+    {EK_ALIAS, EL1008_POS, BECKHOFF_VENDOR_ID, EL1008_PRODUCT,
+     0x6010, 0x01, &input_offset[1], &input_bit[1]},
+    {EK_ALIAS, EL1008_POS, BECKHOFF_VENDOR_ID, EL1008_PRODUCT,
+     0x6020, 0x01, &input_offset[2], &input_bit[2]},
+    {EK_ALIAS, EL1008_POS, BECKHOFF_VENDOR_ID, EL1008_PRODUCT,
+     0x6030, 0x01, &input_offset[3], &input_bit[3]},
+    {EK_ALIAS, EL1008_POS, BECKHOFF_VENDOR_ID, EL1008_PRODUCT,
+     0x6040, 0x01, &input_offset[4], &input_bit[4]},
+    {EK_ALIAS, EL1008_POS, BECKHOFF_VENDOR_ID, EL1008_PRODUCT,
+     0x6050, 0x01, &input_offset[5], &input_bit[5]},
+    {EK_ALIAS, EL1008_POS, BECKHOFF_VENDOR_ID, EL1008_PRODUCT,
+     0x6060, 0x01, &input_offset[6], &input_bit[6]},
+    {EK_ALIAS, EL1008_POS, BECKHOFF_VENDOR_ID, EL1008_PRODUCT,
+     0x6070, 0x01, &input_offset[7], &input_bit[7]},
+
+    {EK_ALIAS, EL2008_POS, BECKHOFF_VENDOR_ID, EL2008_PRODUCT,
+     0x7000, 0x01, &output_offset[0], &output_bit[0]},
+    {EK_ALIAS, EL2008_POS, BECKHOFF_VENDOR_ID, EL2008_PRODUCT,
+     0x7010, 0x01, &output_offset[1], &output_bit[1]},
+    {EK_ALIAS, EL2008_POS, BECKHOFF_VENDOR_ID, EL2008_PRODUCT,
+     0x7020, 0x01, &output_offset[2], &output_bit[2]},
+    {EK_ALIAS, EL2008_POS, BECKHOFF_VENDOR_ID, EL2008_PRODUCT,
+     0x7030, 0x01, &output_offset[3], &output_bit[3]},
+    {EK_ALIAS, EL2008_POS, BECKHOFF_VENDOR_ID, EL2008_PRODUCT,
+     0x7040, 0x01, &output_offset[4], &output_bit[4]},
+    {EK_ALIAS, EL2008_POS, BECKHOFF_VENDOR_ID, EL2008_PRODUCT,
+     0x7050, 0x01, &output_offset[5], &output_bit[5]},
+    {EK_ALIAS, EL2008_POS, BECKHOFF_VENDOR_ID, EL2008_PRODUCT,
+     0x7060, 0x01, &output_offset[6], &output_bit[6]},
+    {EK_ALIAS, EL2008_POS, BECKHOFF_VENDOR_ID, EL2008_PRODUCT,
+     0x7070, 0x01, &output_offset[7], &output_bit[7]},
+
+    {0}
+};
+
+static void signal_handler(int signal_number)
+{
+    (void)signal_number;
+    keep_running = 0;
+}
+
+static void add_ns(struct timespec *time, long nanoseconds)
+{
+    time->tv_nsec += nanoseconds;
+
+    while (time->tv_nsec >= 1000000000L) {
+        time->tv_nsec -= 1000000000L;
+        time->tv_sec++;
+    }
+}
+
+static void set_all_outputs(int value)
+{
+    for (int channel = 0; channel < 8; channel++) {
+        EC_WRITE_BIT(
+            domain_pd + output_offset[channel],
+            output_bit[channel],
+            value ? 1 : 0
+        );
+    }
+}
+
+static uint8_t read_inputs(void)
+{
+    uint8_t value = 0;
+
+    for (int channel = 0; channel < 8; channel++) {
+        if (EC_READ_BIT(
+                domain_pd + input_offset[channel],
+                input_bit[channel])) {
+            value |= (uint8_t)(1U << channel);
+        }
+    }
+
+    return value;
+}
+
+static int configure_master(void)
+{
+    ec_slave_config_t *input_config = NULL;
+    ec_slave_config_t *output_config = NULL;
+
+    master = ecrt_request_master(MASTER_INDEX);
+    if (!master) {
+        fprintf(stderr, "Failed to request EtherCAT master 0.\n");
+        return -1;
+    }
+
+    domain = ecrt_master_create_domain(master);
+    if (!domain) {
+        fprintf(stderr, "Failed to create process-data domain.\n");
+        return -1;
+    }
+
+    input_config = ecrt_master_slave_config(
+        master,
+        EK_ALIAS,
+        EL1008_POS,
+        BECKHOFF_VENDOR_ID,
+        EL1008_PRODUCT
+    );
+
+    if (!input_config) {
+        fprintf(stderr, "Failed to obtain EL1008 slave configuration.\n");
+        return -1;
+    }
+
+    output_config = ecrt_master_slave_config(
+        master,
+        EK_ALIAS,
+        EL2008_POS,
+        BECKHOFF_VENDOR_ID,
+        EL2008_PRODUCT
+    );
+
+    if (!output_config) {
+        fprintf(stderr, "Failed to obtain EL2008 slave configuration.\n");
+        return -1;
+    }
+
+    if (ecrt_slave_config_pdos(
+            input_config,
+            EC_END,
+            el1008_syncs)) {
+        fprintf(stderr, "Failed to configure EL1008 PDOs.\n");
+        return -1;
+    }
+
+    if (ecrt_slave_config_pdos(
+            output_config,
+            EC_END,
+            el2008_syncs)) {
+        fprintf(stderr, "Failed to configure EL2008 PDOs.\n");
+        return -1;
+    }
+
+    if (ecrt_domain_reg_pdo_entry_list(domain, domain_regs)) {
+        fprintf(stderr, "Failed to register PDO entries.\n");
+        return -1;
+    }
+
+    if (ecrt_master_activate(master)) {
+        fprintf(stderr, "Failed to activate EtherCAT master.\n");
+        return -1;
+    }
+
+    domain_pd = ecrt_domain_data(domain);
+    if (!domain_pd) {
+        fprintf(stderr, "Failed to obtain process-data pointer.\n");
+        return -1;
+    }
+
+    return 0;
+}
+
+static void exchange_process_data(void)
+{
+    ecrt_master_receive(master);
+    ecrt_domain_process(domain);
+
+    ecrt_domain_queue(domain);
+    ecrt_master_send(master);
+}
+
+static void safe_shutdown_outputs(void)
+{
+    if (!master || !domain || !domain_pd) {
+        return;
+    }
+
+    set_all_outputs(0);
+
+    /*
+     * Send several zero-output cycles so the terminal receives the safe state
+     * before the application releases the master.
+     */
+    for (int i = 0; i < 10; i++) {
+        exchange_process_data();
+
+        struct timespec delay = {
+            .tv_sec = 0,
+            .tv_nsec = CYCLE_NS
+        };
+
+        nanosleep(&delay, NULL);
+    }
+}
+
+static int run_chase(void)
+{
+    struct timespec wake_time;
+    unsigned long cycle = 0;
+    int active_channel = -1;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &wake_time) != 0) {
+        perror("clock_gettime");
+        return -1;
+    }
+
+    printf("EL2008 LED chase running. Press Ctrl+C to stop.\n");
+
+    while (keep_running) {
+        add_ns(&wake_time, CYCLE_NS);
+
+        ecrt_master_receive(master);
+        ecrt_domain_process(domain);
+
+        /*
+         * Change channel every 500 cycles = 500 ms at a 1 ms cycle.
+         */
+        if ((cycle % 500UL) == 0) {
+            active_channel = (active_channel + 1) % 8;
+            set_all_outputs(0);
+
+            EC_WRITE_BIT(
+                domain_pd + output_offset[active_channel],
+                output_bit[active_channel],
+                1
+            );
+
+            printf("\rEL2008 channel %d ON   ",
+                   active_channel + 1);
+            fflush(stdout);
+        }
+
+        ecrt_domain_queue(domain);
+        ecrt_master_send(master);
+
+        int result = clock_nanosleep(
+            CLOCK_MONOTONIC,
+            TIMER_ABSTIME,
+            &wake_time,
+            NULL
+        );
+
+        if (result != 0 && result != EINTR) {
+            errno = result;
+            perror("clock_nanosleep");
+            return -1;
+        }
+
+        cycle++;
+    }
+
+    printf("\nStopping; forcing all outputs OFF.\n");
+    return 0;
+}
+
+static int run_monitor(void)
+{
+    struct timespec wake_time;
+    uint8_t previous = 0xff;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &wake_time) != 0) {
+        perror("clock_gettime");
+        return -1;
+    }
+
+    printf("EL1008 input monitor running. Press Ctrl+C to stop.\n");
+
+    while (keep_running) {
+        add_ns(&wake_time, CYCLE_NS);
+
+        ecrt_master_receive(master);
+        ecrt_domain_process(domain);
+
+        uint8_t current = read_inputs();
+
+        if (current != previous) {
+            printf("Inputs: ");
+
+            /*
+             * Print channels 8 through 1 so the display resembles a byte.
+             */
+            for (int bit = 7; bit >= 0; bit--) {
+                putchar((current & (1U << bit)) ? '1' : '0');
+            }
+
+            printf("  hex=0x%02X\n", current);
+            previous = current;
+        }
+
+        set_all_outputs(0);
+        ecrt_domain_queue(domain);
+        ecrt_master_send(master);
+
+        int result = clock_nanosleep(
+            CLOCK_MONOTONIC,
+            TIMER_ABSTIME,
+            &wake_time,
+            NULL
+        );
+
+        if (result != 0 && result != EINTR) {
+            errno = result;
+            perror("clock_nanosleep");
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+static void print_usage(const char *program)
+{
+    fprintf(stderr,
+        "Usage: %s chase|monitor\n"
+        "\n"
+        "  chase    Sequentially light EL2008 output LEDs 1-8.\n"
+        "  monitor  Display the EL1008 input byte when it changes.\n",
+        program
+    );
+}
+
+int main(int argc, char **argv)
+{
+    int result = EXIT_FAILURE;
+
+    if (argc != 2) {
+        print_usage(argv[0]);
+        return EXIT_FAILURE;
+    }
+
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
+
+    if (configure_master() != 0) {
+        goto cleanup;
+    }
+
+    /*
+     * Give the master several seconds of cyclic exchange to move the
+     * configured terminals through SAFEOP and into OP.
+     */
+    printf("Activating EtherCAT process data...\n");
+
+    for (int i = 0; i < 3000 && keep_running; i++) {
+        exchange_process_data();
+
+        struct timespec delay = {
+            .tv_sec = 0,
+            .tv_nsec = CYCLE_NS
+        };
+
+        nanosleep(&delay, NULL);
+    }
+
+    if (strcmp(argv[1], "chase") == 0) {
+        result = run_chase() == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    } else if (strcmp(argv[1], "monitor") == 0) {
+        result = run_monitor() == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    } else {
+        print_usage(argv[0]);
+    }
+
+cleanup:
+    safe_shutdown_outputs();
+
+    if (master) {
+        ecrt_release_master(master);
+    }
+
+    return result;
+}
+```
+Ctrl+O
+Enter
+Ctrl+X
+
+Compile It!
+```
+gcc \
+  -std=c11 \
+  -O2 \
+  -Wall \
+  -Wextra \
+  -Wpedantic \
+  -I/usr/local/include \
+  ethercat_io_test.c \
+  -L/usr/local/lib \
+  -Wl,-rpath,/usr/local/lib \
+  -lethercat \
+  -lrt \
+  -o ethercat_io_test
+```
+check it actually exists:
+ls -l ethercat_io_test
+
+RUN
+sudo ./ethercat_io_test chase
+
+The LEDs on the EL2008 should be chasing.
