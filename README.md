@@ -1396,4 +1396,29 @@ cleanup:
     return result;
 }
 ```
++ That works pretty good. It will sequentially test east output/input pair. so when a jumper is present it will verify both modules are functioning.
 
++  Digital I/O Commissioning: PASS
++  ```
+                  Software
+                   │
+                   ▼
+      IgH EtherCAT Application
+                   │
+                   ▼
+          EtherCAT Master
+                   │
+                   ▼
+             Intel I210 NIC
+                   │
+                   ▼
+               EK1100 Coupler
+              ┌─────────────┐
+              │             │
+          EL2008        EL1008
+              │             ▲
+              └────Wire─────┘
+   ```
+   
++ Next steps:
+Connect the IFM AL1333 to the EtherCAT fieldbus, and test that connection, then add in some IO link devices for testing. The goal is to determine if its best to use something like codesys which is only a "soft" real time, or program our own realtime scheduler in C, then add the required "modules" to complete out the system. 
