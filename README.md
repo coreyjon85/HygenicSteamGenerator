@@ -1492,3 +1492,1025 @@ OFF
 → SHUTDOWN
 → FAULT_LOCKOUT
 ```
++ Two mmain processes:
+```
+  steam-rt
+  ├─ owns IgH Master 0
+  ├─ runs the fixed-cycle control loop
+  ├─ reads EtherCAT and IO-Link PDOs
+  ├─ evaluates permissives and trips
+  ├─ executes control logic
+  └─ writes outputs
+
+steam-service
+  ├─ MQTT publishing
+  ├─ configuration
+  ├─ event and alarm logging
+  ├─ diagnostics
+  └─ future HMI/API
+```
++ Seperate the realtime control process from the non-critical processes (telemetry)
+
+```
+steam-controller/
+├── CMakeLists.txt
+├── README.md
+├── config/
+│   └── steam-controller.toml
+├── src/
+│   ├── rt_main.cpp
+│   ├── ethercat_bus.cpp
+│   ├── process_image.cpp
+│   ├── state_machine.cpp
+│   ├── safety.cpp
+│   ├── control.cpp
+│   └── devices/
+│       ├── al1333.cpp
+│       ├── tr2439.cpp
+│       ├── pm1704.cpp
+│       ├── lr2750.cpp
+│       └── lmt100.cpp
+├── service/
+│   ├── management_main.cpp
+│   └── mqtt.cpp
+├── include/
+├── tests/
+│   ├── state_machine_tests.cpp
+│   ├── safety_tests.cpp
+│   └── device_decode_tests.cpp
+├── systemd/
+│   ├── steam-rt.service
+│   └── steam-service.service
+└── docs/
+    └── engineering-log.md
+```
+# Runtime Shell & Safety Output Layer
+
+mkdir -p ~/steam-controller/src
+cd ~/steam-controller
+nano CMakeLists.txt
+```
+cmake_minimum_required(VERSION 3.16)
+
+project(steam_controller VERSION 0.1.0 LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+add_executable(steam-rt
+    src/main.cpp
+)
+
+target_include_directories(steam-rt PRIVATE
+    /usr/local/include
+)
+
+target_link_directories(steam-rt PRIVATE
+    /usr/local/lib
+)
+
+target_link_libraries(steam-rt PRIVATE
+    ethercat
+    pthread
+)
+
+target_compile_options(steam-rt PRIVATE
+    -O2
+    -Wall
+    -Wextra
+    -Wpedantic
+    -Wconversion
+    -Wshadow
+)
+
+target_link_options(steam-rt PRIVATE
+    -Wl,-rpath,/usr/local/lib
+)
+```
+
++Create the runtime shell
+nano src/main.cpp
+
+```
+#define _GNU_SOURCE
+
+#include <ecrt.h>
+
+#include <array>
+#include <atomic>
+#include <cerrno>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <csignal>
+#include <iostream>
+#include <sched.h>
+#include <string_view>
+#include <sys/mman.h>
+#include <time.h>
+#include <unistd.h>
+
+namespace {
+
+// -----------------------------------------------------------------------------
+// Runtime configuration
+// -----------------------------------------------------------------------------
+
+constexpr unsigned int kMasterIndex = 0;
+constexpr std::int64_t kCyclePeriodNs = 5'000'000;  // 5 ms
+constexpr int kRealtimePriority = 70;
+
+constexpr std::uint16_t kAlias = 0;
+constexpr std::uint16_t kEl1008Position = 1;
+constexpr std::uint16_t kEl2008Position = 2;
+
+constexpr std::uint32_t kBeckhoffVendorId = 0x00000002;
+constexpr std::uint32_t kEl1008ProductCode = 0x03f03052;
+constexpr std::uint32_t kEl2008ProductCode = 0x07d83052;
+
+constexpr std::uint64_t kStatusPrintIntervalCycles = 200;  // 1 second
+constexpr std::uint32_t kHealthyCyclesBeforeReady = 100;   // 500 ms
+constexpr std::uint32_t kMaxConsecutiveOverruns = 3;
+
+// For this first shell, EL2008 channel 1 is reserved as the future heater-enable
+// output. It will remain forced OFF because no production permissives exist yet.
+constexpr std::size_t kHeaterEnableChannel = 0;
+
+// -----------------------------------------------------------------------------
+// Signal handling
+// -----------------------------------------------------------------------------
+
+std::atomic_bool g_run{true};
+
+extern "C" void signal_handler(int signal_number)
+{
+    (void)signal_number;
+    g_run.store(false, std::memory_order_relaxed);
+}
+
+// -----------------------------------------------------------------------------
+// Timing helpers
+// -----------------------------------------------------------------------------
+
+timespec add_nanoseconds(timespec value, std::int64_t nanoseconds)
+{
+    value.tv_nsec += static_cast<long>(nanoseconds);
+
+    while (value.tv_nsec >= 1'000'000'000L) {
+        value.tv_nsec -= 1'000'000'000L;
+        ++value.tv_sec;
+    }
+
+    return value;
+}
+
+std::int64_t difference_nanoseconds(
+    const timespec& later,
+    const timespec& earlier)
+{
+    const auto seconds =
+        static_cast<std::int64_t>(later.tv_sec - earlier.tv_sec);
+
+    const auto nanoseconds =
+        static_cast<std::int64_t>(later.tv_nsec - earlier.tv_nsec);
+
+    return seconds * 1'000'000'000LL + nanoseconds;
+}
+
+// -----------------------------------------------------------------------------
+// Process and safety models
+// -----------------------------------------------------------------------------
+
+enum class RuntimeState : std::uint8_t {
+    Starting,
+    HealthyIdle,
+    Faulted,
+    Stopping
+};
+
+enum class FaultCode : std::uint8_t {
+    None,
+    MasterLinkDown,
+    DomainWorkingCounterInvalid,
+    El1008Offline,
+    El2008Offline,
+    El1008NotOperational,
+    El2008NotOperational,
+    RealtimeOverrun,
+    ShutdownRequested
+};
+
+constexpr std::string_view to_string(RuntimeState state)
+{
+    switch (state) {
+        case RuntimeState::Starting:
+            return "STARTING";
+        case RuntimeState::HealthyIdle:
+            return "HEALTHY_IDLE";
+        case RuntimeState::Faulted:
+            return "FAULTED";
+        case RuntimeState::Stopping:
+            return "STOPPING";
+    }
+
+    return "UNKNOWN";
+}
+
+constexpr std::string_view to_string(FaultCode fault)
+{
+    switch (fault) {
+        case FaultCode::None:
+            return "NONE";
+        case FaultCode::MasterLinkDown:
+            return "MASTER_LINK_DOWN";
+        case FaultCode::DomainWorkingCounterInvalid:
+            return "DOMAIN_WC_INVALID";
+        case FaultCode::El1008Offline:
+            return "EL1008_OFFLINE";
+        case FaultCode::El2008Offline:
+            return "EL2008_OFFLINE";
+        case FaultCode::El1008NotOperational:
+            return "EL1008_NOT_OPERATIONAL";
+        case FaultCode::El2008NotOperational:
+            return "EL2008_NOT_OPERATIONAL";
+        case FaultCode::RealtimeOverrun:
+            return "REALTIME_OVERRUN";
+        case FaultCode::ShutdownRequested:
+            return "SHUTDOWN_REQUESTED";
+    }
+
+    return "UNKNOWN";
+}
+
+struct Inputs {
+    std::array<bool, 8> digital_inputs{};
+
+    bool master_link_up{false};
+    bool domain_complete{false};
+
+    bool el1008_online{false};
+    bool el1008_operational{false};
+
+    bool el2008_online{false};
+    bool el2008_operational{false};
+};
+
+struct RequestedOutputs {
+    bool heater_enable{false};
+    std::array<bool, 8> digital_outputs{};
+};
+
+struct ActualOutputs {
+    bool heater_enable{false};
+    std::array<bool, 8> digital_outputs{};
+};
+
+struct RuntimeHealth {
+    RuntimeState state{RuntimeState::Starting};
+    FaultCode active_fault{FaultCode::None};
+
+    std::uint64_t cycle_count{0};
+    std::uint64_t overrun_count{0};
+    std::uint32_t consecutive_overruns{0};
+    std::uint32_t consecutive_healthy_cycles{0};
+
+    std::int64_t last_cycle_lateness_ns{0};
+    std::int64_t worst_cycle_lateness_ns{0};
+};
+
+// -----------------------------------------------------------------------------
+// Safety output enforcement
+// -----------------------------------------------------------------------------
+
+class SafetyOutputLayer {
+public:
+    ActualOutputs enforce(
+        const RequestedOutputs& requested,
+        const Inputs& inputs,
+        RuntimeHealth& health) const
+    {
+        ActualOutputs actual{};
+
+        /*
+         * Determine the first active infrastructure fault.
+         *
+         * The output structure begins zero-initialized. Any return before the
+         * final copy therefore produces the defined safe state: all outputs OFF.
+         */
+
+        if (!inputs.master_link_up) {
+            trip(health, FaultCode::MasterLinkDown);
+            return actual;
+        }
+
+        if (!inputs.domain_complete) {
+            trip(health, FaultCode::DomainWorkingCounterInvalid);
+            return actual;
+        }
+
+        if (!inputs.el1008_online) {
+            trip(health, FaultCode::El1008Offline);
+            return actual;
+        }
+
+        if (!inputs.el2008_online) {
+            trip(health, FaultCode::El2008Offline);
+            return actual;
+        }
+
+        if (!inputs.el1008_operational) {
+            trip(health, FaultCode::El1008NotOperational);
+            return actual;
+        }
+
+        if (!inputs.el2008_operational) {
+            trip(health, FaultCode::El2008NotOperational);
+            return actual;
+        }
+
+        if (health.consecutive_overruns >= kMaxConsecutiveOverruns) {
+            trip(health, FaultCode::RealtimeOverrun);
+            return actual;
+        }
+
+        /*
+         * Infrastructure is healthy. In the future, production permissives
+         * will be inserted here:
+         *
+         * - independent low-water input healthy
+         * - pressure below software trip
+         * - external high-pressure switch healthy
+         * - emergency stop healthy
+         * - IO-Link pressure/level data valid and fresh
+         * - no latched process fault
+         *
+         * Until those exist, heater permission is hard-disabled.
+         */
+        constexpr bool production_permissives_implemented = false;
+
+        actual.digital_outputs = requested.digital_outputs;
+
+        actual.heater_enable =
+            requested.heater_enable &&
+            production_permissives_implemented;
+
+        actual.digital_outputs[kHeaterEnableChannel] =
+            actual.heater_enable;
+
+        return actual;
+    }
+
+private:
+    static void trip(RuntimeHealth& health, FaultCode fault)
+    {
+        health.state = RuntimeState::Faulted;
+
+        if (health.active_fault == FaultCode::None) {
+            health.active_fault = fault;
+        }
+    }
+};
+
+// -----------------------------------------------------------------------------
+// EtherCAT bus
+// -----------------------------------------------------------------------------
+
+class EthercatBus {
+public:
+    EthercatBus() = default;
+
+    EthercatBus(const EthercatBus&) = delete;
+    EthercatBus& operator=(const EthercatBus&) = delete;
+
+    ~EthercatBus()
+    {
+        shutdown();
+    }
+
+    bool initialize()
+    {
+        master_ = ecrt_request_master(kMasterIndex);
+
+        if (master_ == nullptr) {
+            std::cerr << "Failed to request EtherCAT master 0.\n";
+            return false;
+        }
+
+        domain_ = ecrt_master_create_domain(master_);
+
+        if (domain_ == nullptr) {
+            std::cerr << "Failed to create EtherCAT process-data domain.\n";
+            return false;
+        }
+
+        el1008_config_ = ecrt_master_slave_config(
+            master_,
+            kAlias,
+            kEl1008Position,
+            kBeckhoffVendorId,
+            kEl1008ProductCode);
+
+        if (el1008_config_ == nullptr) {
+            std::cerr << "Failed to create EL1008 configuration.\n";
+            return false;
+        }
+
+        el2008_config_ = ecrt_master_slave_config(
+            master_,
+            kAlias,
+            kEl2008Position,
+            kBeckhoffVendorId,
+            kEl2008ProductCode);
+
+        if (el2008_config_ == nullptr) {
+            std::cerr << "Failed to create EL2008 configuration.\n";
+            return false;
+        }
+
+        if (ecrt_slave_config_pdos(
+                el1008_config_,
+                EC_END,
+                el1008_syncs_.data()) != 0) {
+            std::cerr << "Failed to configure EL1008 PDOs.\n";
+            return false;
+        }
+
+        if (ecrt_slave_config_pdos(
+                el2008_config_,
+                EC_END,
+                el2008_syncs_.data()) != 0) {
+            std::cerr << "Failed to configure EL2008 PDOs.\n";
+            return false;
+        }
+
+        if (ecrt_domain_reg_pdo_entry_list(
+                domain_,
+                domain_registrations_.data()) != 0) {
+            std::cerr << "Failed to register EtherCAT PDO entries.\n";
+            return false;
+        }
+
+        /*
+         * Tell the master our intended send interval. This can improve the
+         * master's internal scheduling decisions.
+         */
+        ecrt_master_set_send_interval(
+            master_,
+            static_cast<std::size_t>(kCyclePeriodNs / 1'000));
+
+        if (ecrt_master_activate(master_) != 0) {
+            std::cerr << "Failed to activate EtherCAT master.\n";
+            return false;
+        }
+
+        domain_data_ = ecrt_domain_data(domain_);
+
+        if (domain_data_ == nullptr) {
+            std::cerr << "Failed to obtain EtherCAT process-data pointer.\n";
+            return false;
+        }
+
+        /*
+         * Initialize output image before the first cyclic send.
+         */
+        write_all_outputs_off();
+
+        initialized_ = true;
+        return true;
+    }
+
+    void receive_and_process()
+    {
+        ecrt_master_receive(master_);
+        ecrt_domain_process(domain_);
+    }
+
+    void queue_and_send()
+    {
+        ecrt_domain_queue(domain_);
+        ecrt_master_send(master_);
+    }
+
+    Inputs read_inputs()
+    {
+        Inputs inputs{};
+
+        for (std::size_t channel = 0;
+             channel < inputs.digital_inputs.size();
+             ++channel) {
+            inputs.digital_inputs[channel] =
+                EC_READ_BIT(
+                    domain_data_ + input_offsets_[channel],
+                    input_bits_[channel]) != 0;
+        }
+
+        ec_master_state_t master_state{};
+        ec_domain_state_t domain_state{};
+        ec_slave_config_state_t el1008_state{};
+        ec_slave_config_state_t el2008_state{};
+
+        ecrt_master_state(master_, &master_state);
+        ecrt_domain_state(domain_, &domain_state);
+        ecrt_slave_config_state(el1008_config_, &el1008_state);
+        ecrt_slave_config_state(el2008_config_, &el2008_state);
+
+        inputs.master_link_up = master_state.link_up != 0;
+
+        inputs.domain_complete =
+            domain_state.wc_state == EC_WC_COMPLETE;
+
+        inputs.el1008_online = el1008_state.online != 0;
+        inputs.el1008_operational = el1008_state.operational != 0;
+
+        inputs.el2008_online = el2008_state.online != 0;
+        inputs.el2008_operational = el2008_state.operational != 0;
+
+        return inputs;
+    }
+
+    void write_outputs(const ActualOutputs& outputs)
+    {
+        for (std::size_t channel = 0;
+             channel < outputs.digital_outputs.size();
+             ++channel) {
+            EC_WRITE_BIT(
+                domain_data_ + output_offsets_[channel],
+                output_bits_[channel],
+                outputs.digital_outputs[channel] ? 1 : 0);
+        }
+    }
+
+    void send_safe_state(unsigned int cycles = 20)
+    {
+        if (!initialized_ || domain_data_ == nullptr) {
+            return;
+        }
+
+        write_all_outputs_off();
+
+        timespec delay{
+            .tv_sec = 0,
+            .tv_nsec = static_cast<long>(kCyclePeriodNs)
+        };
+
+        for (unsigned int cycle = 0; cycle < cycles; ++cycle) {
+            ecrt_master_receive(master_);
+            ecrt_domain_process(domain_);
+
+            write_all_outputs_off();
+
+            ecrt_domain_queue(domain_);
+            ecrt_master_send(master_);
+
+            nanosleep(&delay, nullptr);
+        }
+    }
+
+    void shutdown()
+    {
+        if (master_ == nullptr) {
+            return;
+        }
+
+        if (initialized_) {
+            send_safe_state();
+        }
+
+        ecrt_release_master(master_);
+
+        master_ = nullptr;
+        domain_ = nullptr;
+        domain_data_ = nullptr;
+        el1008_config_ = nullptr;
+        el2008_config_ = nullptr;
+        initialized_ = false;
+    }
+
+private:
+    void write_all_outputs_off()
+    {
+        if (domain_data_ == nullptr) {
+            return;
+        }
+
+        for (std::size_t channel = 0;
+             channel < output_offsets_.size();
+             ++channel) {
+            EC_WRITE_BIT(
+                domain_data_ + output_offsets_[channel],
+                output_bits_[channel],
+                0);
+        }
+    }
+
+    ec_master_t* master_{nullptr};
+    ec_domain_t* domain_{nullptr};
+    ec_slave_config_t* el1008_config_{nullptr};
+    ec_slave_config_t* el2008_config_{nullptr};
+    std::uint8_t* domain_data_{nullptr};
+    bool initialized_{false};
+
+    std::array<unsigned int, 8> input_offsets_{};
+    std::array<unsigned int, 8> input_bits_{};
+
+    std::array<unsigned int, 8> output_offsets_{};
+    std::array<unsigned int, 8> output_bits_{};
+
+    std::array<ec_pdo_entry_info_t, 8> el1008_entries_{{
+        {0x6000, 0x01, 1},
+        {0x6010, 0x01, 1},
+        {0x6020, 0x01, 1},
+        {0x6030, 0x01, 1},
+        {0x6040, 0x01, 1},
+        {0x6050, 0x01, 1},
+        {0x6060, 0x01, 1},
+        {0x6070, 0x01, 1},
+    }};
+
+    std::array<ec_pdo_info_t, 8> el1008_pdos_{{
+        {0x1a00, 1, el1008_entries_.data() + 0},
+        {0x1a01, 1, el1008_entries_.data() + 1},
+        {0x1a02, 1, el1008_entries_.data() + 2},
+        {0x1a03, 1, el1008_entries_.data() + 3},
+        {0x1a04, 1, el1008_entries_.data() + 4},
+        {0x1a05, 1, el1008_entries_.data() + 5},
+        {0x1a06, 1, el1008_entries_.data() + 6},
+        {0x1a07, 1, el1008_entries_.data() + 7},
+    }};
+
+    std::array<ec_sync_info_t, 2> el1008_syncs_{{
+        {
+            0,
+            EC_DIR_INPUT,
+            8,
+            el1008_pdos_.data(),
+            EC_WD_DISABLE
+        },
+        {
+            0xff,
+            EC_DIR_INVALID,
+            0,
+            nullptr,
+            EC_WD_DISABLE
+        },
+    }};
+
+    std::array<ec_pdo_entry_info_t, 8> el2008_entries_{{
+        {0x7000, 0x01, 1},
+        {0x7010, 0x01, 1},
+        {0x7020, 0x01, 1},
+        {0x7030, 0x01, 1},
+        {0x7040, 0x01, 1},
+        {0x7050, 0x01, 1},
+        {0x7060, 0x01, 1},
+        {0x7070, 0x01, 1},
+    }};
+
+    std::array<ec_pdo_info_t, 8> el2008_pdos_{{
+        {0x1600, 1, el2008_entries_.data() + 0},
+        {0x1601, 1, el2008_entries_.data() + 1},
+        {0x1602, 1, el2008_entries_.data() + 2},
+        {0x1603, 1, el2008_entries_.data() + 3},
+        {0x1604, 1, el2008_entries_.data() + 4},
+        {0x1605, 1, el2008_entries_.data() + 5},
+        {0x1606, 1, el2008_entries_.data() + 6},
+        {0x1607, 1, el2008_entries_.data() + 7},
+    }};
+
+    std::array<ec_sync_info_t, 2> el2008_syncs_{{
+        {
+            0,
+            EC_DIR_OUTPUT,
+            8,
+            el2008_pdos_.data(),
+            EC_WD_ENABLE
+        },
+        {
+            0xff,
+            EC_DIR_INVALID,
+            0,
+            nullptr,
+            EC_WD_DISABLE
+        },
+    }};
+
+    std::array<ec_pdo_entry_reg_t, 17> domain_registrations_{{
+        {
+            kAlias, kEl1008Position,
+            kBeckhoffVendorId, kEl1008ProductCode,
+            0x6000, 0x01,
+            &input_offsets_[0], &input_bits_[0]
+        },
+        {
+            kAlias, kEl1008Position,
+            kBeckhoffVendorId, kEl1008ProductCode,
+            0x6010, 0x01,
+            &input_offsets_[1], &input_bits_[1]
+        },
+        {
+            kAlias, kEl1008Position,
+            kBeckhoffVendorId, kEl1008ProductCode,
+            0x6020, 0x01,
+            &input_offsets_[2], &input_bits_[2]
+        },
+        {
+            kAlias, kEl1008Position,
+            kBeckhoffVendorId, kEl1008ProductCode,
+            0x6030, 0x01,
+            &input_offsets_[3], &input_bits_[3]
+        },
+        {
+            kAlias, kEl1008Position,
+            kBeckhoffVendorId, kEl1008ProductCode,
+            0x6040, 0x01,
+            &input_offsets_[4], &input_bits_[4]
+        },
+        {
+            kAlias, kEl1008Position,
+            kBeckhoffVendorId, kEl1008ProductCode,
+            0x6050, 0x01,
+            &input_offsets_[5], &input_bits_[5]
+        },
+        {
+            kAlias, kEl1008Position,
+            kBeckhoffVendorId, kEl1008ProductCode,
+            0x6060, 0x01,
+            &input_offsets_[6], &input_bits_[6]
+        },
+        {
+            kAlias, kEl1008Position,
+            kBeckhoffVendorId, kEl1008ProductCode,
+            0x6070, 0x01,
+            &input_offsets_[7], &input_bits_[7]
+        },
+
+        {
+            kAlias, kEl2008Position,
+            kBeckhoffVendorId, kEl2008ProductCode,
+            0x7000, 0x01,
+            &output_offsets_[0], &output_bits_[0]
+        },
+        {
+            kAlias, kEl2008Position,
+            kBeckhoffVendorId, kEl2008ProductCode,
+            0x7010, 0x01,
+            &output_offsets_[1], &output_bits_[1]
+        },
+        {
+            kAlias, kEl2008Position,
+            kBeckhoffVendorId, kEl2008ProductCode,
+            0x7020, 0x01,
+            &output_offsets_[2], &output_bits_[2]
+        },
+        {
+            kAlias, kEl2008Position,
+            kBeckhoffVendorId, kEl2008ProductCode,
+            0x7030, 0x01,
+            &output_offsets_[3], &output_bits_[3]
+        },
+        {
+            kAlias, kEl2008Position,
+            kBeckhoffVendorId, kEl2008ProductCode,
+            0x7040, 0x01,
+            &output_offsets_[4], &output_bits_[4]
+        },
+        {
+            kAlias, kEl2008Position,
+            kBeckhoffVendorId, kEl2008ProductCode,
+            0x7050, 0x01,
+            &output_offsets_[5], &output_bits_[5]
+        },
+        {
+            kAlias, kEl2008Position,
+            kBeckhoffVendorId, kEl2008ProductCode,
+            0x7060, 0x01,
+            &output_offsets_[6], &output_bits_[6]
+        },
+        {
+            kAlias, kEl2008Position,
+            kBeckhoffVendorId, kEl2008ProductCode,
+            0x7070, 0x01,
+            &output_offsets_[7], &output_bits_[7]
+        },
+
+        // Required all-zero terminator.
+        {0}
+    }};
+};
+
+// -----------------------------------------------------------------------------
+// Real-time process preparation
+// -----------------------------------------------------------------------------
+
+bool configure_realtime_process()
+{
+    /*
+     * Lock current and future memory to reduce the chance of page faults in
+     * the cyclic thread.
+     */
+    if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
+        std::cerr
+            << "mlockall failed: "
+            << std::strerror(errno)
+            << '\n';
+        return false;
+    }
+
+    sched_param parameters{};
+    parameters.sched_priority = kRealtimePriority;
+
+    if (sched_setscheduler(0, SCHED_FIFO, &parameters) != 0) {
+        std::cerr
+            << "sched_setscheduler failed: "
+            << std::strerror(errno)
+            << '\n';
+        return false;
+    }
+
+    /*
+     * Touch stack memory before entering the cyclic loop.
+     */
+    constexpr std::size_t kPrefaultBytes = 64 * 1024;
+    volatile std::array<std::uint8_t, kPrefaultBytes> stack_prefault{};
+
+    for (std::size_t index = 0;
+         index < stack_prefault.size();
+         index += 4096) {
+        stack_prefault[index] = 0;
+    }
+
+    return true;
+}
+
+// -----------------------------------------------------------------------------
+// Runtime loop
+// -----------------------------------------------------------------------------
+
+int run_runtime()
+{
+    EthercatBus bus;
+
+    if (!bus.initialize()) {
+        return EXIT_FAILURE;
+    }
+
+    if (!configure_realtime_process()) {
+        bus.send_safe_state();
+        return EXIT_FAILURE;
+    }
+
+    SafetyOutputLayer safety{};
+    RuntimeHealth health{};
+    RequestedOutputs requested{};
+    ActualOutputs actual{};
+
+    /*
+     * No production command path exists yet. Requested outputs remain OFF.
+     */
+    requested.heater_enable = false;
+    requested.digital_outputs.fill(false);
+
+    timespec next_wakeup{};
+
+    if (clock_gettime(CLOCK_MONOTONIC, &next_wakeup) != 0) {
+        std::cerr
+            << "clock_gettime failed: "
+            << std::strerror(errno)
+            << '\n';
+
+        bus.send_safe_state();
+        return EXIT_FAILURE;
+    }
+
+    std::cout
+        << "steam-rt started\n"
+        << "cycle_period_ms=5\n"
+        << "realtime_priority=" << kRealtimePriority << '\n'
+        << "all_outputs_safe_off=true\n";
+
+    while (g_run.load(std::memory_order_relaxed)) {
+        next_wakeup = add_nanoseconds(
+            next_wakeup,
+            kCyclePeriodNs);
+
+        bus.receive_and_process();
+
+        const Inputs inputs = bus.read_inputs();
+
+        /*
+         * This is where the future state machine and controller will set
+         * RequestedOutputs. At this stage they remain false.
+         */
+
+        actual = safety.enforce(
+            requested,
+            inputs,
+            health);
+
+        bus.write_outputs(actual);
+        bus.queue_and_send();
+
+        ++health.cycle_count;
+
+        if (health.active_fault == FaultCode::None) {
+            ++health.consecutive_healthy_cycles;
+
+            if (health.consecutive_healthy_cycles >=
+                kHealthyCyclesBeforeReady) {
+                health.state = RuntimeState::HealthyIdle;
+            }
+        } else {
+            health.consecutive_healthy_cycles = 0;
+        }
+
+        if ((health.cycle_count %
+             kStatusPrintIntervalCycles) == 0) {
+            /*
+             * Printing from the RT loop is acceptable only for this initial
+             * shell. It will move to the management process in the next phase.
+             */
+            std::cout
+                << "state=" << to_string(health.state)
+                << " fault=" << to_string(health.active_fault)
+                << " cycle=" << health.cycle_count
+                << " overruns=" << health.overrun_count
+                << " worst_late_us="
+                << health.worst_cycle_lateness_ns / 1000
+                << " link=" << inputs.master_link_up
+                << " domain_complete=" << inputs.domain_complete
+                << " el1008_op=" << inputs.el1008_operational
+                << " el2008_op=" << inputs.el2008_operational
+                << " heater_actual=" << actual.heater_enable
+                << '\n';
+        }
+
+        const int sleep_result = clock_nanosleep(
+            CLOCK_MONOTONIC,
+            TIMER_ABSTIME,
+            &next_wakeup,
+            nullptr);
+
+        if (sleep_result != 0 && sleep_result != EINTR) {
+            std::cerr
+                << "clock_nanosleep failed: "
+                << std::strerror(sleep_result)
+                << '\n';
+
+            break;
+        }
+
+        timespec actual_wakeup{};
+
+        if (clock_gettime(
+                CLOCK_MONOTONIC,
+                &actual_wakeup) != 0) {
+            break;
+        }
+
+        const std::int64_t lateness_ns =
+            difference_nanoseconds(
+                actual_wakeup,
+                next_wakeup);
+
+        health.last_cycle_lateness_ns = lateness_ns;
+
+        if (lateness_ns > health.worst_cycle_lateness_ns) {
+            health.worst_cycle_lateness_ns = lateness_ns;
+        }
+
+        /*
+         * Treat waking one full cycle late as an overrun.
+         */
+        if (lateness_ns >= kCyclePeriodNs) {
+            ++health.overrun_count;
+            ++health.consecutive_overruns;
+        } else {
+            health.consecutive_overruns = 0;
+        }
+    }
+
+    health.state = RuntimeState::Stopping;
+    health.active_fault = FaultCode::ShutdownRequested;
+
+    std::cout << "Shutdown requested; forcing outputs OFF.\n";
+
+    bus.send_safe_state();
+    bus.shutdown();
+
+    return EXIT_SUCCESS;
+}
+
+}  // namespace
+
+int main()
+{
+    std::signal(SIGINT, signal_handler);
+    std::signal(SIGTERM, signal_handler);
+
+    return run_runtime();
+}
+```
+
+
