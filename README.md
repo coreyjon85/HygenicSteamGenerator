@@ -16,6 +16,9 @@ None of this is necessary. Some contactors, a few switches, some old school mech
 + InfluxDB + Grafana: running on separate server to display dashboards
 + Home Assistant: Non-Critical monitoring & notifications
 
+  #Helpful Resources
+  + https://eci.intel.com/docs/3.0/components/ethercat.html
+
 # PLC Setup
 + Beckoff C6015-0010 Industrial PC.
   + Installed Ubuntu Server 22.04 (ensure the version supports realtime-kernel).
